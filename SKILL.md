@@ -57,6 +57,18 @@ bash triage_tomcat.sh /home/xxx/apache-tomcat-7.0.91 2018-11-15
 
 输出覆盖：实例与运行身份、按天请求量、按 IP 聚合、按小时分布、jsp/war/jspx 落地清单、manager 访问（401/200）、webshell 密码线索、SSH 爆破统计、UID 0 账号与 useradd 记录、可疑文件改动。
 
+三种运行模式：带实例路径+日期（完整）、只带实例路径（跳过当日明细）、不带参数（全盘定位实例后只做全局统计）。
+
+可覆盖的环境变量（非标准环境或本地分析日志副本时用）：
+
+| 变量 | 默认值 | 用途 |
+|---|---|---|
+| `TRIAGE_AUTH_GLOB` | `/var/log/auth.log* /var/log/secure*` | 认证日志路径，RHEL 系改这里 |
+| `TRIAGE_PASSWD` | `/etc/passwd` | 账号文件，用于离线分析副本 |
+| `TRIAGE_ROOTS` | `/` | 全局模式的搜索根，文件系统很大时缩小范围 |
+
+脚本自带 GNU/BSD 兼容层（`find -printf`、`ls --time-style` 在 macOS 上会回退到 `stat`/`ls -T`），因此把日志拷到笔记本分析也能跑。
+
 ### 第 3 步：按"访问量 + 频率"锁定攻击
 
 这是整套分析的核心手法，顺序不要颠倒：
@@ -94,7 +106,8 @@ bash triage_tomcat.sh /home/xxx/apache-tomcat-7.0.91 2018-11-15
 
 ## 资源
 
-- `scripts/rsh.exp` — 期待脚本封装的远程执行器，凭据走环境变量，可选 su 提权。
+- `scripts/rsh.exp` — 期待脚本封装的远程执行器，凭据走环境变量，可选 su 提权。退出码语义：`2`=缺变量、`1`=认证/提权/超时失败、`0`=成功。
 - `scripts/triage_tomcat.sh` — 在目标机一次性跑完的取证采集/统计脚本（只读）。
+- `scripts/selftest.sh` — 离线自测：自动生成夹具（基线日+攻击日日志、部署日志、爆破记录、后门账号、两个木马），断言 21 项输出。改动脚本后先跑它。
 - `references/playbook.md` — 判据、命令变体、常见踩坑与应对。
 - `references/report-template.md` — 取证报告模板，含结论表与时间线格式。

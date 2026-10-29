@@ -25,15 +25,20 @@ log_user 1
 spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o LogLevel=ERROR -o ConnectTimeout=15 -p $port $user@$host
 
+set timeout 30
 expect {
     "assword" { send "$pass\r" }
-    timeout   { puts "\n>>> 登录超时"; exit 1 }
+    timeout   { puts "\n>>> 登录超时（网络不通或端口不对）"; exit 1 }
 }
 expect {
-    -re {[\$#] $} { }
-    "assword"     { send "$pass\r"; exp_continue }
-    timeout       { puts "\n>>> 未拿到 shell 提示符"; exit 1 }
+    -re {[\$#] $}                { }
+    "Permission denied"          { puts "\n>>> 认证失败：用户名或口令错误"; exit 1 }
+    "Too many authentication"    { puts "\n>>> 认证失败：尝试次数过多"; exit 1 }
+    "assword"                    { send "$pass\r"; exp_continue }
+    eof                          { puts "\n>>> 连接被对端关闭"; exit 1 }
+    timeout                      { puts "\n>>> 未拿到 shell 提示符"; exit 1 }
 }
+set timeout 120
 
 # 可选提权：su 的提示符是 "Password:"（首字母大写），统一用 "assword" 匹配
 if {$rpass ne ""} {

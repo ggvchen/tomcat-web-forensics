@@ -138,3 +138,32 @@ cp /root/.bash_history /tmp/bh.bak 2>/dev/null
 - 时间统一标注时区（如"以下均为 UTC"），避免评委按北京时间复核时对不上。
 - 结论表里每个答案后面附一行证据来源（文件名 + 关键行），比单纯给答案更有说服力。
 - 对不确定的项（如上传途径无法从日志证实）明确写"日志不支持该环节，结论基于文件系统时间戳"，不要编造因果。
+
+## 五、脚本自身的坑（维护本 skill 时）
+
+跑 `scripts/selftest.sh` 可以覆盖这些点，改脚本后先跑它。以下三个坑都是实测踩出来的：
+
+### 1. 中文紧跟在变量名后面 → unbound variable
+
+```bash
+echo "搜索根: $SEARCH_ROOTS）--"     # ✗ bash 把全角"）"的首字节并进变量名
+echo "搜索根: ${SEARCH_ROOTS}）--"   # ✓ 用花括号界定
+```
+
+原因是 bash 在非 UTF-8 locale 下按字节解析标识符，多字节字符首字节（≥0x80）会被当成名字的一部分。凡是变量后紧跟中文/全角标点，一律加 `${}`。
+
+### 2. GNU 专属参数在 macOS 上静默失败
+
+`find -printf`、`ls --time-style=full-iso` 在 BSD/macOS 上不存在，配合 `2>/dev/null` 会**静默输出空**——比报错更危险，因为结论看起来"没有木马"。脚本已内置 `flist`/`lt`/`ltl` 兼容函数，新加命令时复用它们，别再直接写 GNU 参数。
+
+### 3. 一句话木马的参数名不止 `name="cmd"`
+
+JSP_KIT 的 `cmd.jsp` 是 `request.getParameter("cmd")`，不带表单 `name` 属性。只匹配 `name="cmd"` 会漏报。识别模式应同时覆盖：
+
+```
+final String PW|String passWord|String pass|getParameter\("[A-Za-z_]+"\)|name="(cmd|pass|pwd)"
+```
+
+### 4. 全局模式全盘 find 会假死
+
+不带参数运行时 `find /` 在容器或大文件系统上可能跑十几分钟。用 `TRIAGE_ROOTS` 限定搜索根，或直接带上实例路径。

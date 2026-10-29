@@ -14,7 +14,31 @@ HOME_DIR="${1:-}"
 FOCUS="${2:-}"
 SEC="================================================================"
 
+# 可覆盖项：便于在非标准环境或测试夹具上运行
+AUTH_GLOB="${TRIAGE_AUTH_GLOB:-/var/log/auth.log* /var/log/secure*}"   # 认证日志（RHEL 系为 secure*）
+PASSWD_FILE="${TRIAGE_PASSWD:-/etc/passwd}"                            # 账号文件
+SEARCH_ROOTS="${TRIAGE_ROOTS:-/}"                                      # 全局模式的搜索根（大文件系统可缩小）
+
+
 hr() { echo; echo "$SEC"; echo "## $*"; echo "$SEC"; }
+
+# 兼容层：GNU coreutils 与 BSD/macOS 的 find/ls 参数不同，取证时常需在本机分析副本
+lt() {   # 带完整时间的 ls -l
+    ls -ld --time-style=full-iso "$@" 2>/dev/null || ls -ldT "$@" 2>/dev/null
+}
+ltl() {
+    ls -l --time-style=full-iso "$@" 2>/dev/null || ls -lT "$@" 2>/dev/null
+}
+flist() {  # flist <dir> <find 表达式...> → "时间 大小 路径"
+    local d="$1"; shift
+    if find "$d" -maxdepth 0 -printf '' >/dev/null 2>&1; then
+        find "$d" "$@" -printf "%T+ %10s %p\n" 2>/dev/null
+    else
+        find "$d" "$@" -type f 2>/dev/null | while IFS= read -r f; do
+            printf "%s %10s %s\n" "$(stat -f "%Sm" -t "%Y-%m-%dT%H:%M:%S" "$f")" "$(stat -f "%z" "$f")" "$f"
+        done
+    fi
+}
 
 # ---------------------------------------------------------------- 0. 环境
 hr "0. 环境与时区（时间对齐是后续一切结论的前提）"
@@ -27,10 +51,16 @@ echo "提示: access log 尾部 +0000 表示 UTC；catalina.*.log 为本地时�
 # ---------------------------------------------------------------- 1. 实例
 hr "1. Tomcat 实例定位与运行身份"
 if [ -z "$HOME_DIR" ]; then
-    echo "-- catalina.sh 候选 --"
-    find / -maxdepth 5 -name catalina.sh 2>/dev/null
+    echo "-- catalina.sh 候选（搜索根: ${SEARCH_ROOTS}）--"
+    # shellcheck disable=SC2086
+    for r in $SEARCH_ROOTS; do
+        [ -d "$r" ] && find "$r" -maxdepth 5 -name catalina.sh 2>/dev/null
+    done
     echo "-- 所有实例的访问日志（日志跨度最长的才是案发现场）--"
-    find / -name "localhost_access_log*" 2>/dev/null | sed 's#/logs/.*##' | sort -u
+    # shellcheck disable=SC2086
+    for r in $SEARCH_ROOTS; do
+        [ -d "$r" ] && find "$r" -name "localhost_access_log*" 2>/dev/null | sed 's#/logs/.*##' | sort -u
+    done
     echo "-- 运行中的进程 --"
     ps -eo user,pid,etime,args 2>/dev/null | grep -i "[c]atalina" | cut -c1-160
     echo
@@ -40,11 +70,11 @@ else
     echo "实例: $HOME_DIR"
     [ -d "$HOME_DIR" ] || { echo "!! 路径不存在"; exit 1; }
     echo "-- 目录时间 --"
-    ls -ld --time-style=full-iso "$HOME_DIR" "$HOME_DIR/webapps" 2>/dev/null
+    lt "$HOME_DIR" "$HOME_DIR/webapps"
     echo "-- 运行身份 --"
     ps -eo user,pid,args 2>/dev/null | grep -i "[c]atalina" | grep -F "$HOME_DIR" | cut -c1-160
     echo "-- webapps --"
-    ls -l --time-style=full-iso "$HOME_DIR/webapps" 2>/dev/null
+    ltl "$HOME_DIR/webapps"
 fi
 
 LOGDIR="${HOME_DIR:+$HOME_DIR/logs}"
@@ -64,11 +94,6 @@ if [ -n "$LOGDIR" ]; then
 
     # ------------------------------------------------------------ 3. 当天
     if [ -n "$FOCUS" ]; then
-        # 把 2018-11-15 转成日志里的 15/Nov/2018
-        MON=$(date -d "$FOCUS" +%b 2>/dev/null)
-        DD=$(date -d "$FOCUS" +%d 2>/dev/null)
-        YY=$(date -d "$FOCUS" +%Y 2>/dev/null)
-        TAG="${DD}/${MON}/${YY}"
         F="$LOGDIR/localhost_access_log.${FOCUS}.txt"
 
         hr "3. $FOCUS 当日：按来源聚合与按小时分布"
@@ -100,8 +125,8 @@ if [ -n "$LOGDIR" ]; then
 
     # ------------------------------------------------------------ 5. 木马
     hr "5. 脚本文件落地清单（webshell 排查，按 mtime 倒序）"
-    find "$HOME_DIR/webapps" \( -name "*.jsp" -o -name "*.jspx" -o -name "*.war" \) \
-        -printf "%T+ %10s %p\n" 2>/dev/null | sort | grep -viE "/examples?/|/docs/" | tail -25
+    flist "$HOME_DIR/webapps" \( -name "*.jsp" -o -name "*.jspx" -o -name "*.war" \) \
+        | sort | grep -viE "/examples?/|/docs/" | tail -25
     echo "提示: war 的 mtime 是落盘时间；同级 app 目录 mtime 是展开时间；"
     echo "      work/Catalina/localhost/<app>/ 下的 .class 时间 = 首次被容器编译（说明木马已生效）。"
 
@@ -110,7 +135,7 @@ if [ -n "$LOGDIR" ]; then
 
     hr "7. webshell 密码线索"
     find "$HOME_DIR/webapps" -name "*.jsp" -size -2M 2>/dev/null | grep -viE "/examples?/|/docs/" | while read -r j; do
-        hit=$(grep -oE ".{0,20}(final String PW|String pass|passWord|\"pwd\"|name=\"cmd\")[^;]{0,40}" "$j" 2>/dev/null | head -3)
+        hit=$(grep -aoE ".{0,25}(final String PW|String passWord|String pass|getParameter\(\"[A-Za-z_]+\"\)|name=\"(cmd|pass|pwd)\")[^;]{0,40}" "$j" 2>/dev/null | head -3)
         if [ -n "$hit" ]; then
             echo "-- $j"
             echo "$hit" | sed 's/^/     /'
@@ -120,32 +145,41 @@ fi
 
 # ---------------------------------------------------------------- 8. SSH
 hr "8. SSH 爆破统计（务必包含轮转日志并按 IP 分离）"
-ls -l /var/log/auth.log* /var/log/secure* 2>/dev/null
+echo "认证日志来源: $AUTH_GLOB"
+# 此处需要 word splitting 展开通配符，故不加引号
+# shellcheck disable=SC2086
+ls -l $AUTH_GLOB 2>/dev/null
 echo "-- 各文件 Failed password 计数 --"
-for f in /var/log/auth.log* /var/log/secure*; do
+# shellcheck disable=SC2086
+for f in $AUTH_GLOB; do
     [ -f "$f" ] || continue
     case "$f" in *.gz) continue;; esac
     echo "   $(grep -c "Failed password" "$f" 2>/dev/null)  $f"
 done
 echo "-- 按 IP 聚合（剔除误报 IP 后才是攻击者次数）--"
-grep -h "Failed password" /var/log/auth.log* /var/log/secure* 2>/dev/null \
+# shellcheck disable=SC2086
+grep -h "Failed password" $AUTH_GLOB 2>/dev/null \
     | grep -oE "from [0-9a-fA-F.:]+" | awk '{print $2}' | sort | uniq -c | sort -rn | head -10
 echo "-- 爆破起止时间（找出最密集的那一段）--"
-grep -h "Failed password" /var/log/auth.log* /var/log/secure* 2>/dev/null | head -2
-grep -h "Failed password" /var/log/auth.log* /var/log/secure* 2>/dev/null | tail -2
+# shellcheck disable=SC2086
+grep -h "Failed password" $AUTH_GLOB 2>/dev/null | head -2
+# shellcheck disable=SC2086
+grep -h "Failed password" $AUTH_GLOB 2>/dev/null | tail -2
 echo "-- 是否有爆破成功 --"
-grep -h "Accepted" /var/log/auth.log* /var/log/secure* 2>/dev/null | tail -15
+# shellcheck disable=SC2086
+grep -h "Accepted" $AUTH_GLOB 2>/dev/null | tail -15
 
 # ---------------------------------------------------------------- 9. 账号
 hr "9. 后门账号排查"
 echo "-- UID 0 账号（除 root 外均为后门）--"
-awk -F: '$3==0 {print $1"  uid="$3"  gid="$4"  home="$6"  shell="$7}' /etc/passwd
+awk -F: '$3==0 {print $1"  uid="$3"  gid="$4"  home="$6"  shell="$7}' "$PASSWD_FILE"
 echo "-- 可登录 shell 的账号 --"
-awk -F: '$7 !~ /(nologin|false|sync)$/ {print $1"  uid="$3"  "$7}' /etc/passwd
+awk -F: '$7 !~ /(nologin|false|sync)$/ {print $1"  uid="$3"  "$7}' "$PASSWD_FILE"
 echo "-- 账号文件时间 --"
-ls -l --time-style=full-iso /etc/passwd /etc/shadow /etc/group /etc/gshadow 2>/dev/null
+ltl /etc/passwd /etc/shadow /etc/group /etc/gshadow
 echo "-- useradd / groupadd 记录（创建时间与创建者会话）--"
-grep -hE "useradd|groupadd|new user|new group|chpasswd" /var/log/auth.log* 2>/dev/null | tail -15
+# shellcheck disable=SC2086
+grep -hE "useradd|groupadd|new user|new group|chpasswd" $AUTH_GLOB 2>/dev/null | tail -15
 echo "-- sudoers 中是否被动过 --"
 grep -rnE "NOPASSWD|ALL=\(ALL" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | head -10
 
@@ -153,7 +187,7 @@ grep -rnE "NOPASSWD|ALL=\(ALL" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | head -
 hr "10. 反取证与持久化迹象"
 for h in /root/.bash_history /home/*/.bash_history; do
     [ -f "$h" ] || continue
-    echo "-- $h  $(ls -l --time-style=full-iso "$h" | awk '{print $6" "$7}')"
+    echo "-- $h  $(lt "$h" | awk '{print $(NF-3)" "$(NF-2)" "$(NF-1)}')"
     grep -nE "vi .*bash_history|history -c|unset HISTFILE|rm -rf /var/log" "$h" 2>/dev/null | head -3
 done
 echo "-- 计划任务 --"
