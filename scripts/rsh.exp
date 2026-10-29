@@ -1,0 +1,63 @@
+#!/usr/bin/expect -f
+#
+# 远程执行器（供取证使用，只读）
+#   用法:  T_HOST=1.2.3.4 T_PORT=22 T_USER=u T_PASS='p' [T_ROOT_PASS='rp'] ./rsh.exp "命令"
+#   说明:  凭据只从环境变量读取，不写入脚本、不落盘。
+#          T_ROOT_PASS 非空时自动 su - root；为空则用当前用户身份执行。
+#   输出:  原始回显 + 退出标记 __EOC__
+#
+set timeout 120
+set cmd [lindex $argv 0]
+
+if {![info exists env(T_HOST)] || ![info exists env(T_USER)] || ![info exists env(T_PASS)]} {
+    puts "缺少环境变量: T_HOST / T_USER / T_PASS"
+    exit 2
+}
+set host  $env(T_HOST)
+set port  22
+if {[info exists env(T_PORT)]} { set port $env(T_PORT) }
+set user  $env(T_USER)
+set pass  $env(T_PASS)
+set rpass ""
+if {[info exists env(T_ROOT_PASS)]} { set rpass $env(T_ROOT_PASS) }
+
+log_user 1
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR -o ConnectTimeout=15 -p $port $user@$host
+
+expect {
+    "assword" { send "$pass\r" }
+    timeout   { puts "\n>>> 登录超时"; exit 1 }
+}
+expect {
+    -re {[\$#] $} { }
+    "assword"     { send "$pass\r"; exp_continue }
+    timeout       { puts "\n>>> 未拿到 shell 提示符"; exit 1 }
+}
+
+# 可选提权：su 的提示符是 "Password:"（首字母大写），统一用 "assword" 匹配
+if {$rpass ne ""} {
+    send "su - root\r"
+    expect {
+        "assword" { send "$rpass\r" }
+        timeout   { puts "\n>>> su 未出现密码提示"; exit 1 }
+    }
+    expect {
+        -re {[\$#] $} { }
+        timeout       { puts "\n>>> 提权失败（口令错误或禁止 su）"; exit 1 }
+    }
+}
+
+# 固定提示符，避免各发行版默认提示符差异导致误匹配
+send "PS1='R> '\r"
+expect -re {R> }
+
+send "$cmd; echo __EOC__\r"
+expect {
+    "__EOC__" { }
+    timeout   { puts "\n>>> 命令执行超时"; }
+}
+expect -re {R> }
+send "exit\r"
+expect -timeout 8 eof
+exit 0
