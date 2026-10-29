@@ -30,31 +30,35 @@ for app, jsp in [("JspWar/index.jsp", 'final String PW = "admin"; //password\n')
     os.makedirs(os.path.dirname(p), exist_ok=True)
     open(p, "w").write(jsp)
 
-def line(ip, ts, path, code=200, size=1234):
-    return '%s - - [%s +0000] "%s HTTP/1.1" %s %s\n' % (ip, ts, path, code, size)
+def line(ip, ts, method, path, code=200, size=1234):
+    # 必须与真实 Tomcat access log 的字段顺序一致，否则 awk 的 $7/$9 会错位，
+    # 断言看着过、其实在验错的列（夹具保真度问题，踩过一次）。
+    return '%s - - [%s +0000] "%s %s HTTP/1.1" %s %s\n' % (ip, ts, method, path, code, size)
 
-# 基线日：单 IP，量级数百
+# 基线日：单 IP，量级数百，全部 200 且 URL 高度重复（正常浏览特征）
 for day in ("13", "14"):
     with open(os.path.join(logs, "localhost_access_log.2018-11-%s.txt" % day), "w") as f:
         for i in range(210 if day == "13" else 450):
             f.write(line("10.0.0.7", "%s/Nov/2018:10:%02d:%02d" % (day, i // 60 % 60, i % 60),
-                         "/resource/default/static/assets/js/app.js"))
+                         "GET", "/resource/default/static/assets/js/app.js"))
 
 # 攻击日：600 条来自攻击者 + 12 条来自运维
-rows = ["03:30:21 GET /manager/html 401"]
-rows += ["04:23:26 GET /JspWar/ 200"]
-rows += ["04:24:21 GET /JspWar/ 200"]
-rows += ["05:12:33 POST /JspWar/index.jsp 302"]
-rows += ["02:%02d:%02d GET /resource/default/static/plugins/layui/layui.js 200" % (i // 60 % 60, i % 60)
-         for i in range(596)]
+# 攻击特征 = 大量唯一 URL 的 404（扫描探路）+ 路径遍历导致的 500（注入报错）
+rows = [("03:30:21", "GET", "/manager/html", 401),
+        ("04:23:26", "GET", "/JspWar/", 200),
+        ("04:24:21", "GET", "/JspWar/", 200),
+        ("05:12:33", "POST", "/JspWar/index.jsp", 302)]
+for i in range(300):
+    rows.append(("02:%02d:%02d" % (i // 60 % 60, i % 60), "GET", "/admin_%03d.php" % i, 404))
+for i in range(296):
+    rows.append(("02:%02d:%02d" % (i // 60 % 60, i % 60), "GET",
+                 "/page/about.html?query=..%%2F..%%2F..%%2F..%%2Fetc%%2Fpasswd_%03d" % i, 500))
 with open(os.path.join(logs, "localhost_access_log.2018-11-15.txt"), "w") as f:
-    for r in rows:
-        parts = r.split()
-        ts = "15/Nov/2018:" + parts[0]
-        f.write(line("192.168.43.101", ts, parts[1], parts[2],
-                     8663 if parts[1].startswith("/JspWar") else 1234))
+    for ts, method, path, code in rows:
+        f.write(line("192.168.43.101", "15/Nov/2018:" + ts, method, path, code,
+                     8663 if path.startswith("/JspWar") else 1234))
     for i in range(12):
-        f.write(line("10.0.0.9", "15/Nov/2018:09:%02d:%02d" % (i, i), "/page/list"))
+        f.write(line("10.0.0.9", "15/Nov/2018:09:%02d:%02d" % (i, i), "GET", "/page/list"))
 
 # catalina 部署日志
 with open(os.path.join(logs, "catalina.2018-11-15.log"), "w") as f:
@@ -95,6 +99,10 @@ has "大马密码被提取"                      'final String PW = "admin"'    
 has "一句话木马参数被提取"                'getParameter("cmd")'           "$OUT"
 has "爆破总数按 IP 聚合正确"              "1437 192.168.43.101"           "$OUT"
 has "误报 IP 未与攻击者合并"              "3 10.0.0.9"                    "$OUT"
+has "爆破跨度按时间排序（非文件顺序）"    "Nov 15 03:00:00  ->  Nov 15"   "$OUT"
+has "按天统计带状态码分布"                "[200="                         "$OUT"
+has "攻击日能取到 404/500 分布"           "404"                           "$OUT"
+has "攻击日 404/500 载荷被列出"           "..%2F..%2F"                    "$OUT"
 has "后门账号 UID=0 被标记"               "gu3st"                         "$OUT"
 hasnt "无命令缺失报错"                    "command not found"             "$OUT"
 hasnt "无权限/路径报错泄漏"               "No such file or directory"     "$OUT"
@@ -115,6 +123,16 @@ has  "路径不存在时给出明确提示"            "路径不存在"        
 echo "== 用例 4: 攻击日无当日日志"
 OUT4="$(TRIAGE_AUTH_GLOB="$FX/auth.log.*" TRIAGE_PASSWD="$FX/passwd" bash "$TRIAGE" "$FX/tomcat" 2019-01-01 2>&1)"
 has  "缺失日志日给出提示"                  "未找到"                        "$OUT4"
+
+echo "== 用例 5: 认证日志不可读（模拟非 root 身份）"
+# 这条最关键：读不到认证日志时若静默输出空白，会被误读成"没有爆破"。
+cp "$FX/auth.log.1" "$FX/auth_locked.log"
+chmod 000 "$FX/auth_locked.log"
+OUT5="$(TRIAGE_AUTH_GLOB="$FX/auth_locked.log" TRIAGE_PASSWD="$FX/passwd" bash "$TRIAGE" "$FX/tomcat" 2018-11-15 2>&1)"
+chmod 644 "$FX/auth_locked.log"
+has  "不可读时给出显式告警"                "不代表没有攻击"                "$OUT5"
+has  "不可读时逐文件标记"                  "[不可读]"                      "$OUT5"
+hasnt "不可读时不伪造爆破数字"             "0  $FX/auth_locked.log"        "$OUT5"
 
 echo
 echo "=================================================="

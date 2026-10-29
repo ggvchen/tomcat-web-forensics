@@ -5,6 +5,7 @@
 #   说明:  凭据只从环境变量读取，不写入脚本、不落盘。
 #          T_ROOT_PASS 非空时自动 su - root；为空则用当前用户身份执行。
 #   输出:  原始回显 + 退出标记 __EOC__
+#   退出码: 0 成功 / 1 登录或连接失败 / 2 缺少环境变量 / 3 提权失败(已中止)
 #
 set timeout 120
 set cmd [lindex $argv 0]
@@ -26,17 +27,25 @@ spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o LogLevel=ERROR -o ConnectTimeout=15 -p $port $user@$host
 
 set timeout 30
-expect {
-    "assword" { send "$pass\r" }
-    timeout   { puts "\n>>> 登录超时（网络不通或端口不对）"; exit 1 }
-}
-expect {
-    -re {[\$#] $}                { }
-    "Permission denied"          { puts "\n>>> 认证失败：用户名或口令错误"; exit 1 }
-    "Too many authentication"    { puts "\n>>> 认证失败：尝试次数过多"; exit 1 }
-    "assword"                    { send "$pass\r"; exp_continue }
-    eof                          { puts "\n>>> 连接被对端关闭"; exit 1 }
-    timeout                      { puts "\n>>> 未拿到 shell 提示符"; exit 1 }
+# 端口开着但不是 SSH（如映射到了 web 服务）时，ssh 会以 banner 交换超时退出，
+# 此时 spawn 句柄已关闭，直接 expect 会抛 Tcl traceback。用 catch 兜住，给出可读结论。
+if {[catch {
+    expect {
+        "assword" { send "$pass\r" }
+        timeout   { puts "\n>>> 登录超时（网络不通或端口不对）"; exit 1 }
+        eof       { puts "\n>>> 连接被对端关闭（该端口可能不是 SSH）"; exit 1 }
+    }
+    expect {
+        -re {[\$#] $}                { }
+        "Permission denied"          { puts "\n>>> 认证失败：用户名或口令错误"; exit 1 }
+        "Too many authentication"    { puts "\n>>> 认证失败：尝试次数过多"; exit 1 }
+        "assword"                    { send "$pass\r"; exp_continue }
+        eof                          { puts "\n>>> 连接被对端关闭"; exit 1 }
+        timeout                      { puts "\n>>> 未拿到 shell 提示符"; exit 1 }
+    }
+} err]} {
+    puts "\n>>> 会话异常终止：该端口可能不是 SSH 服务（$err）"
+    exit 1
 }
 set timeout 120
 
@@ -49,12 +58,28 @@ if {$rpass ne ""} {
     }
     expect {
         -re {[\$#] $} { }
-        timeout       { puts "\n>>> 提权失败（口令错误或禁止 su）"; exit 1 }
+        timeout       { puts "\n>>> 提权无响应"; exit 3 }
     }
+    # 关键校验：su 口令错误时也会回到普通用户的提示符，
+    # 仅凭提示符判断会把"提权失败"误判为成功，导致后续取证在无权限身份下静默产出空结果。
+    send "echo __UID__=\$(id -u)\r"
+    expect {
+        -re {__UID__=([0-9]+)} { set curuid $expect_out(1,string) }
+        timeout                { puts "\n>>> 无法确认提权结果"; exit 3 }
+    }
+    expect -re {[\$#] $}
+    if {$curuid != 0} {
+        puts "\n>>> 提权失败：当前 uid=$curuid（root 口令错误或禁止 su），已中止以免产出空结论"
+        exit 3
+    }
+    puts "\n>>> 已提权至 root (uid=0)"
 }
 
 # 固定提示符，避免各发行版默认提示符差异导致误匹配
 send "PS1='R> '\r"
+expect -re {R> }
+# 加宽远端终端：默认 80 列会把含长 URL 的证据行折行，破坏后续人工阅读
+send "stty cols 200 2>/dev/null; true\r"
 expect -re {R> }
 
 send "$cmd; echo __EOC__\r"

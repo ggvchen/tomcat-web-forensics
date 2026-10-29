@@ -87,10 +87,15 @@ if [ -n "$LOGDIR" ]; then
     for f in "$LOGDIR"/localhost_access_log*.txt; do
         [ -f "$f" ] || continue
         n=$(wc -l < "$f" 2>/dev/null | tr -d ' ')
-        echo "-- $(basename "$f")  共 ${n} 条"
+        # 同时给出状态码分布：请求量高不等于被攻击，正常浏览后台也能把量拉起来，
+        # 真正的攻击特征是 404/500 占比高（扫描探路 + 注入报错）。
+        st=$(awk '{print $9}' "$f" 2>/dev/null | sort | uniq -c | sort -rn | head -3 \
+             | awk '{printf "%s=%s ", $2, $1}')
+        echo "-- $(basename "$f")  共 ${n} 条  [${st}]"
         awk '{print $1}' "$f" 2>/dev/null | sort | uniq -c | sort -rn | head -4 | sed 's/^/     /'
     done
     echo "提示: 正常站点日请求量通常在数百级；某天突增 10 倍以上且来源单一，即为攻击日。"
+    echo "      但务必结合状态码：某天量高却以 200 为主 = 正常使用；404/500 占比高 = 扫描与注入。"
 
     # ------------------------------------------------------------ 3. 当天
     if [ -n "$FOCUS" ]; then
@@ -100,12 +105,19 @@ if [ -n "$LOGDIR" ]; then
         if [ -f "$F" ]; then
             echo "-- 来源 IP TOP --"
             awk '{print $1}' "$F" | sort | uniq -c | sort -rn | head -8
+            echo "-- 状态码分布（404/500 占比高 = 扫描/注入）--"
+            awk '{print $9}' "$F" | sort | uniq -c | sort -rn | head -6
+            echo "-- 唯一 URL 数（请求量大但唯一 URL 少 = 正常浏览；反之 = 扫描器）--"
+            awk '{print $7}' "$F" | sort -u | wc -l
             echo "-- 小时分布（看攻击集中在几点）--"
             awk '{print substr($4,14,2)}' "$F" | sort | uniq -c
-            echo "-- 攻击日高频路径 TOP（静态资源会被过滤掉）--"
-            awk '{print $6" "$7}' "$F" \
+            echo "-- 404/500 请求样例（找攻击载荷：..%2F 遍历、union select、cmd= 等）--"
+            awk '$9==404 || $9==500 {print $9"  "$7}' "$F" | cut -c1-110 | sort -u | head -12
+            echo "-- 访问路径前缀 TOP（按前两级聚拢；扫描器会产生海量唯一 URL，逐条列会被冲散）--"
+            awk '{print $7}' "$F" \
                 | grep -viE "\.(js|css|png|jpg|jpeg|gif|ico|woff2?|ttf|svg)" \
-                | sort | uniq -c | sort -rn | head -15
+                | awk -F/ '{if (NF>=3) print "/"$2"/"$3; else if (NF==2) print "/"$2; else print "/"}' \
+                | sort | uniq -c | sort -rn | head -12
         else
             echo "!! 未找到 $F"
         fi
@@ -149,25 +161,50 @@ echo "认证日志来源: $AUTH_GLOB"
 # 此处需要 word splitting 展开通配符，故不加引号
 # shellcheck disable=SC2086
 ls -l $AUTH_GLOB 2>/dev/null
+
+# 护栏：读不到认证日志时明确告警。否则在非 root 身份下 grep 会静默失败，
+# 输出一片空白，被误读成"没有爆破、没有后门记录"——取证中最危险的假阴性。
+AUTH_READABLE=0
+# shellcheck disable=SC2086
+for f in $AUTH_GLOB; do
+    [ -f "$f" ] || continue
+    case "$f" in *.gz) continue;; esac
+    [ -r "$f" ] && [ -s "$f" ] && AUTH_READABLE=1
+done
+if [ "$AUTH_READABLE" -eq 0 ]; then
+    echo "!! 警告：认证日志不可读或为空（当前 uid=$(id -u)）。"
+    echo "!! 下面的爆破统计与账号创建记录将为空，这**不代表没有攻击**。"
+    echo "!! 请以 root 身份重跑：T_ROOT_PASS='<root口令>' rsh.exp 'bash triage_tomcat.sh ...'"
+fi
+
 echo "-- 各文件 Failed password 计数 --"
 # shellcheck disable=SC2086
 for f in $AUTH_GLOB; do
     [ -f "$f" ] || continue
     case "$f" in *.gz) continue;; esac
-    echo "   $(grep -c "Failed password" "$f" 2>/dev/null)  $f"
+    if [ -r "$f" ]; then
+        echo "   $(grep -c "Failed password" "$f" 2>/dev/null)  $f"
+    else
+        echo "   [不可读]  $f"
+    fi
 done
 echo "-- 按 IP 聚合（剔除误报 IP 后才是攻击者次数）--"
 # shellcheck disable=SC2086
 grep -h "Failed password" $AUTH_GLOB 2>/dev/null \
     | grep -oE "from [0-9a-fA-F.:]+" | awk '{print $2}' | sort | uniq -c | sort -rn | head -10
-echo "-- 爆破起止时间（找出最密集的那一段）--"
+echo "-- 爆破时间跨度（按来源 IP，取拓扑前三名；跨文件按时间排序，非文件顺序）--"
 # shellcheck disable=SC2086
-grep -h "Failed password" $AUTH_GLOB 2>/dev/null | head -2
+for ip in $(grep -h "Failed password" $AUTH_GLOB 2>/dev/null \
+        | grep -oE "from [0-9a-fA-F.:]+" | awk '{print $2}' | sort | uniq -c | sort -rn | head -3 | awk '{print $2}'); do
+    # shellcheck disable=SC2086
+    first=$(grep -hF "from $ip " $AUTH_GLOB 2>/dev/null | grep -F "Failed password" | sort -k1,1M -k2,2n -k3,3 | head -1 | cut -c1-15)
+    # shellcheck disable=SC2086
+    last=$(grep -hF "from $ip " $AUTH_GLOB 2>/dev/null | grep -F "Failed password" | sort -k1,1M -k2,2n -k3,3 | tail -1 | cut -c1-15)
+    printf "   %-18s %s  ->  %s\n" "$ip" "$first" "$last"
+done
+echo "-- 是否有爆破成功（Accepted 记录，注意与运维的正常登录区分）--"
 # shellcheck disable=SC2086
-grep -h "Failed password" $AUTH_GLOB 2>/dev/null | tail -2
-echo "-- 是否有爆破成功 --"
-# shellcheck disable=SC2086
-grep -h "Accepted" $AUTH_GLOB 2>/dev/null | tail -15
+grep -h "Accepted" $AUTH_GLOB 2>/dev/null | sort -k1,1M -k2,2n -k3,3 | tail -15
 
 # ---------------------------------------------------------------- 9. 账号
 hr "9. 后门账号排查"
